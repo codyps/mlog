@@ -32,7 +32,9 @@ use std::convert::From;
 ///     length: u32,
 ///     /// Randomly generated on Log creation. Allows determining if external `Cursors` (which may
 ///     /// live past the lifetime of the `Log` by being on remote systems) are still valid.
-///     epoch: u32,
+///     /// On generation, the lower 32-bits are zeroed. When the log completes a "cycle" the epoch
+///     /// is incremented by 1.
+///     epoch: u64,
 ///
 ///     /// Note on `head` and `tail`: the majority of the time, the log is expected to be full.
 ///     /// When the log is full these will both be modified by the consumers, and will be directly
@@ -73,6 +75,11 @@ impl<'a> Log<'a> {
     pub fn cursor_from_end(&self) -> Cursor {
         todo!()
     }
+
+    /// Read the entry immediately after `cursor`, and return that entry and a new cursor.
+    pub fn read_at(&self, _cursor: &Cursor) -> Option<(Entry<'a>, Cursor)> {
+        todo!();
+    }
 }
 
 /// A `Cursor` is a location within the [`Log`] which allows (when combined with the [`Log`]),
@@ -84,6 +91,6 @@ pub struct Cursor {
 
 /// 
 #[derive(Debug)]
-pub struct Entry {
-
+pub struct Entry<'a> {
+    data: &'a [u8],
 }
