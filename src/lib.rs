@@ -6,9 +6,17 @@
 //! 1. defines a Log, which is a area of memory which persists across resets
 //! 2. define consumers of this Log, which might be things like serialization to flash memory or
 //!    sending over a network interface
-//! 3. 
+//! 3.
+//!
+//!
+//! Other similar designs:
+//!
+//!  - [Flash circular buffer (FCB)](https://mynewt.apache.org/latest/os/modules/fcb/fcb.html) does
+//!    something similar, but is designed for use with flash storage (and it's limitations wrt
+//!    sections/pages)
+#![no_std]
 #![warn(missing_docs, rust_2018_idioms, missing_debug_implementations)]
-use std::mem;
+use core::mem;
 
 const LOG_MAGIC_V1: u32 = 0x12aab766;
 
@@ -33,8 +41,11 @@ const LOG_MAGIC_V1: u32 = 0x12aab766;
 /// ```
 #[derive(Debug)]
 pub struct Log<'a> {
-    header: &'a LogHeader,
-    data: &'a [u8]
+    header: &'a mut LogHeader,
+    data: &'a mut [u8],
+
+    /// Location where the last entry is located
+    tail: u16,
 }
 
 /// LogHeader describes the log so that it can continue to be used across partial-reset events
@@ -47,14 +58,20 @@ pub struct Log<'a> {
 /// surviving a partial reset-event, they do _not_ make the `Log` `Sync`: if multiple `Log`
 /// writers (or a writer and any number of readers) exsit, external syncronization mechanisms
 /// (mutexes, interrupt disabling, etc) are required.
+///
+/// NOTE: this is marked `repr(C)` so that it's layout is consistent between 2 compilations for the
+/// same platform. Additionally, the layout of the struct is chosen keeping in mind typical C
+/// alignment rules
+#[repr(C)]
 #[derive(Debug)]
 struct LogHeader {
-    /// LOG_MAGIC_V1
+    /// Set to `LOG_MAGIC_V1` by initialization
     magic: u32,
     /// Number of bytes considered part of the log
     /// This is included so that when the log size changes we can correctly invalidate our
     /// header
     length: u32,
+
     /// Randomly generated on Log creation. Allows determining if external `Cursors` (which may
     /// live past the lifetime of the `Log` by being on remote systems) are still valid.
     /// On generation, the lower 32-bits are zeroed. When the log completes a "cycle" the epoch
@@ -62,19 +79,22 @@ struct LogHeader {
     epoch: u64,
 
     /// Note on `head` and `tail`: the majority of the time, the log is expected to be full.
-    /// When the log is full these will both be modified by the consumers, and will be directly
+    /// When the log is full these will both be modified by the producers, and will be directly
     /// related to one another. It may be useful to consider another mechanism for encoding
     /// this data given the nature of the Log is somewhat different than a normal circular
     /// queue.
-
+    ///
     /// Location where the next entry will be written
     head: u16,
-    /// Location where the last entry is located
-    tail: u16,
+
+    /// same content as `head`, but inverted
+    head_check: u16,
 }
 
+/*
 impl<'a> From<&'a [u8]> for Log<'a> {
-    fn from(data: &'a [u8]) -> Self {
+    /// A _read-only_ initializer
+    fn from(data: &'a [u8]) -> Result<Self, Error> {
         let (lh_b, ld) = data.split_at(mem::size_of::<LogHeader>());
         let lh_m = unsafe {
             let (h, b, t) = lh_b.align_to::<LogHeader>();
@@ -94,18 +114,77 @@ impl<'a> From<&'a [u8]> for Log<'a> {
             panic!("invalid magic, reformat required");
         }
 
-        Log {
+        Ok(Log {
             header: lh_m,
             data: ld,
-        }
+        })
     }
 }
+*/
 
 impl<'a> Log<'a> {
+    /// Initialize the log, given the contiguous memory region `backing_storage` to use to store
+    /// our data.
+    ///
+    /// `backing_storage` is required to be write-through. In other words: it must write not
+    /// perform caching that defers updating anything that doesn't persist across the resets we
+    /// expect `Log` to survive. What this means is heavily dependent on the architecture/machine in use.
+    ///
+    /// `potential_epoch` should be a random value that is generated prior to each call to
+    /// `Log::init()`. It may or may not be used, depending on the state of the log.
+    ///
+    /// # Panics
+    ///
+    ///  - If `backing_storage` is too short (lacks space for `LogHeader`)
+    ///  - If the alignment of `backing_storage` is insufficient.
+    ///
+    pub fn init(backing_storage: &'a mut [u8], potential_epoch: u64) -> Self {
+        let store_len: u32 = backing_storage.len().try_into().unwrap();
+        let (lh_b, ld) = backing_storage.split_at_mut(mem::size_of::<LogHeader>());
+
+        // unsafety:
+        let lh_m = unsafe {
+            let (h, b, t) = lh_b.align_to_mut::<LogHeader>();
+
+            // If any of these fail, an invalid memory region has been passed to us. Right now, we
+            // consider this a programming error. If a platform exists where the definition of the
+            // memory used for the log is supplied by some configuration, etc. it may make sense to
+            // change this into a `TryFrom` and return a reasonable error.
+            assert_eq!(h.len(), 0);
+            assert_eq!(b.len(), 1);
+            assert_eq!(t.len(), 0);
+
+            &mut b[0]
+        };
+
+        if lh_m.magic != LOG_MAGIC_V1 {
+            reformat(lh_m, potential_epoch, store_len);
+        }
+
+        // TODO: CHECKSUM
+
+        if lh_m.length != store_len {
+            reformat(lh_m, potential_epoch, store_len);
+        }
+
+        fn reformat(lh_m: &mut LogHeader, potential_epoch: u64, store_len: u32) {
+            lh_m.epoch = potential_epoch;
+            lh_m.length = store_len;
+            lh_m.head = 0;
+            lh_m.tail = 0;
+
+            // FIXME: placing magic setting last is important. Do something to make this write
+            // ordering for sure.
+            cache_flush();
+            lh_m.magic = LOG_MAGIC_V1;
+        }
+
+        todo!()
+    }
 
     /// Obtain a cursor that will start reading from the oldest entry in the log
     pub fn cursor_from_start(&self) -> Cursor {
-        todo!() 
+        todo!()
     }
 
     /// Obtain a cursor that will start reading from the next entry that is added to the log
@@ -126,11 +205,16 @@ impl<'a> Log<'a> {
 /// reading subseqeunt log entries.
 #[derive(Debug)]
 pub struct Cursor {
-
+    epoch: u64,
+    index: u16,
 }
 
-/// 
+///
 #[derive(Debug)]
 pub struct Entry<'a> {
     data: &'a [u8],
 }
+
+// Right now, this is just a dummy so I can annotate points. In reality, this needs to be provided
+// by the log initializer.
+fn cache_flush() {}
